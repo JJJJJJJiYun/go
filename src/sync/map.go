@@ -108,6 +108,17 @@ func newEntry(i interface{}) *entry {
 // Load returns the value stored in the map for a key, or nil if no
 // value is present.
 // The ok result indicates whether value was found in the map.
+// 1. 读read map
+// 2. 没读到并且dirty map和read map不一致，进入3，否则跳到8
+// 3. 加锁
+// 4. 在读read map，作双重校验，防止在读和加锁之间其他goroutine已经把旧的dirty map晋升到了read map
+// 5. 没读到并且dirty map和read map不一致，进入6，否则跳到8
+// 6. 读dirty map
+// 7. 增加穿透计数
+// 7.1 计数+1
+// 7.2 判断是否满足晋升条件，穿透计数>dirty map大小，满足进入7.3，不满足跳到8
+// 7.3 将dirty map完全赋给read map，dirty map置nil，穿透计数置0
+// 8. 返回数据
 func (m *Map) Load(key interface{}) (value interface{}, ok bool) {
 	read, _ := m.read.Load().(readOnly)
 	// 尝试从read map中读数据
@@ -150,13 +161,27 @@ func (e *entry) load() (value interface{}, ok bool) {
 }
 
 // Store sets the value for a key.
+// 1. 读read map
+// 2. 读到了，进入2.1，否则，进入3
+// 2.1 判断key是否被标记删除了，如果是，进入3
+// 2.2 更新key并返回
+// 3. 加锁
+// 4. 如果read map中存在该key
+// 4.1 如果这个key是被标记删除的，那么在dirty map中应该不存在这个key，要先在dirty map中加上
+// 4.2 更新key，跳到7
+// 5. 如果dirty map中存在该key
+// 5.1 更新key，跳到7
+// 6. 如果read和dirty map中都不存在该key，说明是新增
+// 6.1 如果read和dirty不一致，说明需要初始化dirty map，将read map中所有非nil值赋给dirty map，并把原来的nil值打上删除标记
+// 6.2 在dirty map中新增这个key
+// 7. 解锁
 func (m *Map) Store(key, value interface{}) {
 	read, _ := m.read.Load().(readOnly)
 	// 如果read map中存在该key，尝试存储到read map
 	if e, ok := read.m[key]; ok && e.tryStore(&value) {
 		return
 	}
-	// 加锁，并进行双重检查
+	// 加锁
 	m.mu.Lock()
 	read, _ = m.read.Load().(readOnly)
 	// 如果read map存在该key
@@ -302,6 +327,13 @@ func (e *entry) tryLoadOrStore(i interface{}) (actual interface{}, loaded, ok bo
 
 // LoadAndDelete deletes the value for a key, returning the previous value if any.
 // The loaded result reports whether the key was present.
+// 1. 读read map
+// 2. 没读到并且read和dirty map不一致，进入3，否则进入7
+// 3. 加锁
+// 4. 再读read map，双重检验，如果还是没读到并且read和dirty map不一致，进入5，否则进入6
+// 5. 直接删除dirty map中的这个key（delete），并增加穿透计数
+// 6. 解锁
+// 7. 在read map中，将value置nil
 func (m *Map) LoadAndDelete(key interface{}) (value interface{}, loaded bool) {
 	read, _ := m.read.Load().(readOnly)
 	e, ok := read.m[key]
@@ -359,6 +391,13 @@ func (e *entry) delete() (value interface{}, ok bool) {
 //
 // Range may be O(N) with the number of elements in the map even if f returns
 // false after a constant number of calls.
+// 1. 读read map
+// 2. 如果read和dirty map不一致，进入2.1，否则进入3
+// 2.1 加锁
+// 2.2 再读read map，双重校验，如果read和dirty map不一致，进入2.3,否则进入2.4
+// 2.3 把dirty map赋给read map，强制晋升
+// 2.4 解锁
+// 3. 遍历read map
 func (m *Map) Range(f func(key, value interface{}) bool) {
 	// We need to be able to iterate over all of the keys that were already
 	// present at the start of the call to Range.
