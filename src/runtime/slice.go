@@ -11,9 +11,12 @@ import (
 )
 
 type slice struct {
+	// 指向数组的指针
 	array unsafe.Pointer
-	len   int
-	cap   int
+	// 切片长度
+	len int
+	// 切片容量
+	cap int
 }
 
 // A notInHeapSlice is a slice backed by go:notinheap memory.
@@ -81,6 +84,7 @@ func makeslicecopy(et *_type, tolen int, fromlen int, from unsafe.Pointer) unsaf
 }
 
 func makeslice(et *_type, len, cap int) unsafe.Pointer {
+	// 计算容量所需要的内存大小
 	mem, overflow := math.MulUintptr(et.size, uintptr(cap))
 	if overflow || mem > maxAlloc || len < 0 || len > cap {
 		// NOTE: Produce a 'len out of range' error instead of a
@@ -88,13 +92,15 @@ func makeslice(et *_type, len, cap int) unsafe.Pointer {
 		// 'cap out of range' is true too, but since the cap is only being
 		// supplied implicitly, saying len is clearer.
 		// See golang.org/issue/4085.
+		// 计算长度所需要的内存大小
 		mem, overflow := math.MulUintptr(et.size, uintptr(len))
+		// 这里如果长度超出范围，会直接报长度异常，而不是容量异常
 		if overflow || mem > maxAlloc || len < 0 {
 			panicmakeslicelen()
 		}
 		panicmakeslicecap()
 	}
-
+	// 分配内存，内存的分配以容量为准
 	return mallocgc(mem, et, true)
 }
 
@@ -130,44 +136,51 @@ func growslice(et *_type, old slice, cap int) slice {
 	if msanenabled {
 		msanread(old.array, uintptr(old.len*int(et.size)))
 	}
-
+	// 如果新容量小于旧容量，panic
 	if cap < old.cap {
 		panic(errorString("growslice: cap out of range"))
 	}
-
+	// 如果这个类型需要的内存为0
+	// 返回一个zerobase组成的切片
 	if et.size == 0 {
 		// append should not create a slice with nil pointer but non-zero len.
 		// We assume that append doesn't need to preserve old.array in this case.
 		return slice{unsafe.Pointer(&zerobase), old.len, cap}
 	}
-
+	// 开始扩容了
 	newcap := old.cap
 	doublecap := newcap + newcap
+	// 如果传入的容量大于旧容量的两倍，新容量就是传入的容量
 	if cap > doublecap {
 		newcap = cap
 	} else {
+		// 旧的长度<1024，这里是长度，不是内存大小，新容量等于旧容量的两倍
 		if old.len < 1024 {
 			newcap = doublecap
 		} else {
 			// Check 0 < newcap to detect overflow
 			// and prevent an infinite loop.
+			// 循环：旧容量每次*1.25，直到超过传入的容量
+			// 0 < newcap 防止溢出
 			for 0 < newcap && newcap < cap {
 				newcap += newcap / 4
 			}
 			// Set newcap to the requested cap when
 			// the newcap calculation overflowed.
+			// 如果溢出了，直接设为传入的容量
 			if newcap <= 0 {
 				newcap = cap
 			}
 		}
 	}
-
+	// 计算新切片的容量
 	var overflow bool
 	var lenmem, newlenmem, capmem uintptr
 	// Specialize for common values of et.size.
 	// For 1 we don't need any division/multiplication.
 	// For sys.PtrSize, compiler will optimize division/multiplication into a shift by a constant.
 	// For powers of 2, use a variable shift.
+	// 内存对齐，向上取整，申请的内存有可能大于et.size * newcap
 	switch {
 	case et.size == 1:
 		lenmem = uintptr(old.len)
@@ -220,20 +233,27 @@ func growslice(et *_type, old slice, cap int) slice {
 	}
 
 	var p unsafe.Pointer
+	// 类型是否为指针
 	if et.ptrdata == 0 {
 		p = mallocgc(capmem, nil, false)
 		// The append() that calls growslice is going to overwrite from old.len to cap (which will be the new length).
 		// Only clear the part that will not be overwritten.
+		// 把内存中新长度开始的地址到新容量的值清空
 		memclrNoHeapPointers(add(p, newlenmem), capmem-newlenmem)
 	} else {
+		// 如果是指针，涉及到goroutine，需要做特殊处理
+		// todo 梳理清楚为什么这里需要特殊处理
 		// Note: can't use rawmem (which avoids zeroing of memory), because then GC can scan uninitialized memory.
 		p = mallocgc(capmem, et, true)
+		// 如果写屏障开启了
 		if lenmem > 0 && writeBarrier.enabled {
 			// Only shade the pointers in old.array since we know the destination slice p
 			// only contains nil pointers because it has been cleared during alloc.
+			// 屏蔽旧的切片的长度
 			bulkBarrierPreWriteSrcOnly(uintptr(p), uintptr(old.array), lenmem-et.size+et.ptrdata)
 		}
 	}
+	// 开始复制
 	memmove(p, old.array, lenmem)
 
 	return slice{p, old.len, newcap}
@@ -244,15 +264,18 @@ func isPowerOfTwo(x uintptr) bool {
 }
 
 func slicecopy(toPtr unsafe.Pointer, toLen int, fmPtr unsafe.Pointer, fmLen int, width uintptr) int {
+	// 如果from或者to其中一个长度为0，不用拷贝
 	if fmLen == 0 || toLen == 0 {
 		return 0
 	}
 
+	// 找到from和to里较短的那一个
 	n := fmLen
 	if toLen < n {
 		n = toLen
 	}
 
+	// 宽度为0，不用拷贝
 	if width == 0 {
 		return n
 	}
@@ -270,6 +293,7 @@ func slicecopy(toPtr unsafe.Pointer, toLen int, fmPtr unsafe.Pointer, fmLen int,
 
 	size := uintptr(n) * width
 	if size == 1 { // common case worth about 2x to do here
+		// 只有一个指针
 		// TODO: is this still worth it with new memmove impl?
 		*(*byte)(toPtr) = *(*byte)(fmPtr) // known to be a byte pointer
 	} else {
